@@ -110,7 +110,7 @@ class Worker(QThread):
             try:
                 extra=json.loads(self.cfg.get("extra_params","{}") or "{}")
                 if not isinstance(extra, dict):
-                    raise ValueError("额外请求参数必须是 JSON 对象，例如 {""quality"": ""high""}")
+                    raise ValueError('额外请求参数必须是 JSON 对象，例如 {"quality": "high"}')
             except json.JSONDecodeError as e:
                 raise ValueError(f"额外请求参数 JSON 格式错误：{e}")
             self.progress.emit("正在请求图像服务…")
