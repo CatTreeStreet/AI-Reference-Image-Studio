@@ -25,6 +25,75 @@ def load_settings():
 def save_settings(data):
     settings_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def build_endpoint(base_url, endpoint):
+    """Join a provider base URL and endpoint without duplicating /v1."""
+    base = base_url.strip().rstrip("/")
+    path = endpoint.strip()
+    if not base or not path:
+        raise ValueError("请填写 API Base URL 和接口路径。")
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    # Treat Base URL as the prefix; endpoint may be /v1/... or images/...
+    from urllib.parse import urlsplit, urlunsplit
+    b = urlsplit(base)
+    base_path = b.path.rstrip("/")
+    endpoint_path = "/" + path.lstrip("/")
+    if base_path and endpoint_path.startswith(base_path + "/"):
+        final_path = endpoint_path
+    elif base_path.endswith("/v1") and endpoint_path.startswith("/v1/"):
+        final_path = base_path + endpoint_path[3:]
+    else:
+        final_path = base_path + endpoint_path
+    return urlunsplit((b.scheme, b.netloc, final_path, "", ""))
+
+
+def extract_images(body):
+    """Accept common OpenAI-compatible and relay-provider image response shapes."""
+    if isinstance(body, list):
+        candidates = body
+    elif isinstance(body, dict):
+        candidates = body.get("data") or body.get("images") or body.get("output") or []
+        if isinstance(candidates, dict):
+            candidates = candidates.get("images") or candidates.get("data") or [candidates]
+        if not candidates and any(k in body for k in ("b64_json", "url", "image", "image_url")):
+            candidates = [body]
+    else:
+        candidates = []
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    out = []
+    for item in candidates:
+        if isinstance(item, str):
+            value = item
+        elif isinstance(item, dict):
+            value = (item.get("b64_json") or item.get("base64") or item.get("image")
+                     or item.get("url") or item.get("image_url") or item.get("data"))
+        else:
+            value = None
+        if not value:
+            continue
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("b64_json") or value.get("data")
+        if not isinstance(value, str):
+            continue
+        if value.startswith("data:") and "," in value:
+            header, value = value.split(",", 1)
+            mime = header.split(";")[0].lower()
+            ext = "jpg" if "jpeg" in mime else ("webp" if "webp" in mime else "png")
+            try:
+                out.append((base64.b64decode(value), ext))
+            except Exception:
+                continue
+        elif value.startswith(("http://", "https://")):
+            out.append((value, "url"))
+        else:
+            try:
+                out.append((base64.b64decode(value), "png"))
+            except Exception:
+                continue
+    return out
+
+
 class Worker(QThread):
     done = Signal(list)
     failed = Signal(str)
@@ -34,39 +103,58 @@ class Worker(QThread):
         self.count=count; self.strength=strength
     def run(self):
         try:
-            base=self.cfg["base_url"].rstrip("/")+"/"
             headers={"Authorization":"Bearer "+self.cfg["api_key"]}
             model=self.cfg["image_model"]
             endpoint=self.cfg["edit_path"] if self.image_path else self.cfg["generate_path"]
-            url=urljoin(base, endpoint.lstrip("/"))
+            url=build_endpoint(self.cfg["base_url"], endpoint)
+            try:
+                extra=json.loads(self.cfg.get("extra_params","{}") or "{}")
+                if not isinstance(extra, dict):
+                    raise ValueError("额外请求参数必须是 JSON 对象，例如 {""quality"": ""high""}")
+            except json.JSONDecodeError as e:
+                raise ValueError(f"额外请求参数 JSON 格式错误：{e}")
             self.progress.emit("正在请求图像服务…")
             if self.image_path:
+                field=(self.cfg.get("image_field","image").strip() or "image")
                 with open(self.image_path,"rb") as f:
-                    files={"image":(Path(self.image_path).name,f,"application/octet-stream")}
-                    data={"model":model,"prompt":self.prompt,"n":str(self.count),
-                          "size":self.cfg["size"],"strength":str(self.strength)}
+                    files={field:(Path(self.image_path).name,f,"application/octet-stream")}
+                    data={"model":model,"prompt":self.prompt,"n":str(self.count),"size":self.cfg["size"]}
+                    data.update({k: str(v) if not isinstance(v,(dict,list)) else json.dumps(v,ensure_ascii=False)
+                                 for k,v in extra.items()})
                     r=requests.post(url,headers=headers,files=files,data=data,timeout=self.cfg["timeout"])
             else:
                 payload={"model":model,"prompt":self.prompt,"n":self.count,"size":self.cfg["size"]}
+                payload.update(extra)
                 r=requests.post(url,headers={**headers,"Content-Type":"application/json"},
                                 json=payload,timeout=self.cfg["timeout"])
-            if not r.ok: raise RuntimeError(f"HTTP {r.status_code}: {r.text[:1200]}")
-            body=r.json(); items=body.get("data",[])
-            if not items: raise RuntimeError("接口返回成功，但响应中没有 data 图片列表。请检查服务商的响应格式。")
+            if not r.ok:
+                detail=r.text[:2000]
+                raise RuntimeError(f"HTTP {r.status_code}：{detail}\n\n请检查中转站地址、模型名、接口路径及额外参数。")
+            try:
+                body=r.json()
+            except Exception:
+                raise RuntimeError("接口返回的不是 JSON。响应开头：\n"+r.text[:1000])
+            items=extract_images(body)
             out=[]
-            for i,item in enumerate(items):
-                raw=item.get("b64_json")
-                if raw: blob=base64.b64decode(raw)
-                elif item.get("url"):
-                    q=requests.get(item["url"],timeout=self.cfg["timeout"]); q.raise_for_status(); blob=q.content
-                else: continue
-                ext="png"
-                if blob[:3]==b"\\xff\\xd8\\xff": ext="jpg"
-                elif blob[:4]==b"RIFF": ext="webp"
-                out.append((blob,ext))
-            if not out: raise RuntimeError("没有识别到 b64_json 或 url 图片数据。")
+            for value,ext in items:
+                if ext=="url":
+                    q=requests.get(value,timeout=self.cfg["timeout"]); q.raise_for_status()
+                    blob=q.content
+                    if blob[:3]==b"\xff\xd8\xff": ext="jpg"
+                    elif blob[:4]==b"RIFF": ext="webp"
+                    else: ext="png"
+                else:
+                    blob=value
+                    if blob[:3]==b"\xff\xd8\xff": ext="jpg"
+                    elif blob[:4]==b"RIFF": ext="webp"
+                if blob:
+                    out.append((blob,ext))
+            if not out:
+                preview=json.dumps(body,ensure_ascii=False)[:1600]
+                raise RuntimeError("接口请求成功，但未识别到图片。支持 data[].b64_json、data[].url、images、output、Base64 和 data:image/... 返回。\n响应内容：\n"+preview)
             self.done.emit(out)
-        except Exception as e: self.failed.emit(str(e))
+        except Exception as e:
+            self.failed.emit(str(e))
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -83,10 +171,16 @@ class MainWindow(QMainWindow):
         self.model=QLineEdit(self.cfg.get("image_model","gpt-image-1"))
         self.genpath=QLineEdit(self.cfg.get("generate_path","/v1/images/generations"))
         self.editpath=QLineEdit(self.cfg.get("edit_path","/v1/images/edits"))
+        self.imagefield=QLineEdit(self.cfg.get("image_field","image"))
+        self.extra=QLineEdit(self.cfg.get("extra_params","{}"))
         self.timeout=QSpinBox(); self.timeout.setRange(30,900); self.timeout.setValue(int(self.cfg.get("timeout",300)))
-        for label,w in [("API Base URL",self.base),("API Key",self.key),("图像模型",self.model),
-                        ("文生图 Endpoint",self.genpath),("图生图 Endpoint",self.editpath),("超时（秒）",self.timeout)]:
+        for label,w in [("API Base URL（支持中转站）",self.base),("API Key",self.key),("生图模型名称",self.model),
+                        ("文生图接口路径",self.genpath),("图生图接口路径",self.editpath),
+                        ("参考图字段名",self.imagefield),("额外请求参数 JSON",self.extra),("超时（秒）",self.timeout)]:
             form.addRow(label,w)
+        hint=QLabel("中转站示例：Base URL 填 https://域名/v1；接口路径填 images/generations。可按服务商要求填写额外参数。")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#777")
+        form.addRow(hint)
         save=QPushButton("保存 API 设置"); save.clicked.connect(self.save_api); form.addRow(save); lv.addWidget(api)
         opt=QGroupBox("02 · 画布与生成参数"); of=QFormLayout(opt)
         self.ratio=QComboBox(); self.ratio.addItems(list(RATIOS)); self.ratio.setCurrentText("21:9")
@@ -123,7 +217,9 @@ class MainWindow(QMainWindow):
             w,h=2100,round(2100*ratio[1]/ratio[0]); self.width.setValue(w); self.height.setValue(h)
     def save_api(self):
         self.cfg.update(base_url=self.base.text().strip(),api_key=self.key.text().strip(),image_model=self.model.text().strip(),
-          generate_path=self.genpath.text().strip(),edit_path=self.editpath.text().strip(),timeout=self.timeout.value())
+          generate_path=self.genpath.text().strip(),edit_path=self.editpath.text().strip(),
+          image_field=self.imagefield.text().strip() or "image",extra_params=self.extra.text().strip() or "{}",
+          timeout=self.timeout.value())
         save_settings(self.cfg); QMessageBox.information(self,"已保存","API 设置已保存在本机用户目录，不会上传到 GitHub。")
     def pick_image(self):
         p,_=QFileDialog.getOpenFileName(self,"选择参考图片","","Images (*.png *.jpg *.jpeg *.webp)")
@@ -144,7 +240,9 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(self.status.setText); self.worker.done.connect(self.got_results); self.worker.failed.connect(self.failed); self.worker.start()
     def save_api_silent(self):
         self.cfg.update(base_url=self.base.text().strip(),api_key=self.key.text().strip(),image_model=self.model.text().strip(),
-          generate_path=self.genpath.text().strip(),edit_path=self.editpath.text().strip(),timeout=self.timeout.value())
+          generate_path=self.genpath.text().strip(),edit_path=self.editpath.text().strip(),
+          image_field=self.imagefield.text().strip() or "image",extra_params=self.extra.text().strip() or "{}",
+          timeout=self.timeout.value())
         save_settings(self.cfg)
     def got_results(self, items):
         self.bar.hide(); self.results=items; self.status.setText(f"完成：{len(items)} 张图片")
